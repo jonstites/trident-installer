@@ -77,22 +77,6 @@ get_dlg_ans(){
   done
 }
 
-getDisks(){
-  #generate the disk list
-  opts=""
-  opts=$(sfdisk -l | grep "Disk /dev/" | grep -v "/loop" | cut -d , -f 1 | cut -d / -f 3- | while read _disk
-  do
-    echo -n " $(echo $_disk | cut -d : -f 1) \"$(echo $_disk | cut -d ' ' -f 2-)\""
-  done )
-  get_dlg_ans "--menu \"Which disk do you want to install to?\" 0 0 0 . \"Rescan for devices\" ${opts}"
-  if [ "${ANS}" = "." ] ; then
-    ANS=""
-  elif [ -z "${ANS}" ] ; then
-    exit 1 #cancelled
-  fi
-  export DISK="/dev/${ANS}"
-}
-
 getRepotype(){
   opts=" glibc \"Standard packages (default)\" musl \"Lightweight system. No proprietary packages\" "
   get_dlg_ans "--menu \"Pick the system package type. This cannot be easily changed later.\" 0 0 0 ${opts}"
@@ -159,25 +143,40 @@ echo "-----------------"
 echo "Step 1 : Formatting the disk"
 echo "-----------------"
 echo "Erasing the first 200MB of the disk"
-dd if=/dev/zero of=${DISK} bs=100M count=2
+dd if=/dev/zero of=${DISK1} bs=100M count=2
+dd if=/dev/zero of=${DISK2} bs=100M count=2
 
 #xbps-install -y -S --repository=${REPO}
 #echo "repository=${REPO}" > /etc/xbps.d/repo.conf
 
-echo "Formatting the disk: ${BOOTMODE} ${DISK}"
-sfdisk -w always ${DISK} << EOF
+echo "Formatting the disk: ${BOOTMODE} ${DISK1}"
+sfdisk -w always ${DISK1} << EOF
 	label: gpt
 	,100M,U
 	,10M,21686148-6449-6E6F-744E-656564454649,*
 	;
 EOF
-exit_err $? "Could not partition the disk: ${DISK}"
-EFIDRIVE="${DISK}1"
-BOOTDRIVE="${DISK}2"
-SYSTEMDRIVE="${DISK}3"
+exit_err $? "Could not partition the disk: ${DISK1}"
+echo "Formatting the disk: ${BOOTMODE} ${DISK2}"
+sfdisk -w always ${DISK2} << EOF
+	label: gpt
+	,100M,U
+	,10M,21686148-6449-6E6F-744E-656564454649,*
+	;
+EOF
+exit_err $? "Could not partition the disk: ${DISK2}"
+
+EFIDRIVE1="${DISK1}1"
+BOOTDRIVE1="${DISK1}2"
+SYSTEMDRIVE1="${DISK1}3"
+
+EFIDRIVE2="${DISK2}1"
+BOOTDRIVE2="${DISK2}2"
+SYSTEMDRIVE2="${DISK2}3"
 
 #Formatting the boot partition (FAT32)
-mkfs -t msdos ${EFIDRIVE}
+mkfs -t msdos ${EFIDRIVE1}
+mkfs -t msdos ${EFIDRIVE2}
 
 # Setup the void tweaks for ZFS 
 # Steps found at: https://github.com/nightah/void-install
@@ -187,6 +186,9 @@ exit_err $? "Could not verify ZFS module"
 
 ip link sh | grep ether | cut -d ' ' -f 6 | tr -d ":" >> /etc/hostid
 
+
+# Ideally, create separate bpool and rpool to workaround grub limitations
+# but still have native ZFS encryption
 echo "Creating ZFS Pool: ${ZPOOL}"
 zpool create -f -o ashift=12 -d \
 		-o feature@async_destroy=enabled \
@@ -209,8 +211,8 @@ zpool create -f -o ashift=12 -d \
 		-O normalization=formD \
 		-O relatime=on \
 		-O xattr=sa \
-		${ZPOOL} ${SYSTEMDRIVE}
-exit_err $? "Could not create pool: ${ZPOOL} on ${SYSTEMDRIVE}"
+		${ZPOOL} mirror ${SYSTEMDRIVE1} ${SYSTEMDRIVE2}
+exit_err $? "Could not create pool: ${ZPOOL} on ${SYSTEMDRIVE1}, ${SYSTEMDRIVE2}"
 #Configure the pool now
 zfs set compression=on ${ZPOOL}
 zfs create -o canmount=off ${ZPOOL}/ROOT
@@ -229,13 +231,22 @@ exit_err $? "Could not import the new pool at ${MNT}"
 zfs mount ${ZPOOL}/ROOT/${INITBE}
 exit_err $? "Count not mount the root ZFS dataset"
 
-datasets="home var var/logs var/tmp var/mail"
+datasets="home var var/logs"
 for ds in ${datasets}
 do
 echo "Creating Dataset: ${ds}"
   zfs create -o compression=lz4 -o mountpoint=/${ds} ${ZPOOL}/${ds}
   exit_err $? "Could not create dataset: ${ZPOOL}/${ds}"
 done
+
+datasets="var/tmp var/lib/docker var/snap"
+for ds in ${datasets}
+do
+echo "Creating no-snapshot Dataset: ${ds}"
+  zfs create -o com.sun:auto-snapshot=false  -o compression=lz4 -o mountpoint=/${ds} ${ZPOOL}/${ds}
+  exit_err $? "Could not create dataset: ${ZPOOL}/${ds}"
+done
+
 
 dirs="boot/grub boot/efi dev etc proc run sys"
 for dir in ${dirs}
@@ -244,8 +255,8 @@ do
   exit_err $? "Could not create directory: ${MNT}/${dir}"
 done
 
-mount $EFIDRIVE ${MNT}/boot/efi
-exit_err $? "Could not mount EFI boot partition: ${EFIDRIVE} -> ${MNT}/boot/efi (${BOOTMODE})"
+mount $EFIDRIVE1 ${MNT}/boot/efi
+exit_err $? "Could not mount EFI boot partition: ${EFIDRIVE1} -> ${MNT}/boot/efi (${BOOTMODE})"
 
 
 dirs="dev proc sys run"
@@ -393,7 +404,8 @@ ${CHROOT} xbps-reconfigure -f linux${linuxver}
 echo "Installing GRUB bootloader"
 #Stamp GPT loader on disk itself
 #${CHROOT} grub-mkconfig -o {MNT}/boot/grub/grub.cfg
-${CHROOT} grub-install ${BOOTDEVICE}
+${CHROOT} grub-install ${BOOTDEVICE1}
+${CHROOT} grub-install ${BOOTDEVICE2}
 #Stamp EFI loader on the EFI partition
 #Ro create a project-trident directory only
 ${CHROOT} grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Project-Trident --recheck --no-floppy
@@ -409,10 +421,10 @@ echo "[SUCCESS] Reboot the system and remove the install media to boot into the 
 # ===============
 #  LOAD SETTINGS
 # ===============
-while [ -z "${DISK}" ]
-do
-  getDisks
-done
+
+export DISK1=/dev/disk/by-id/nvme-Sabrent_27FF0799139700048859
+export DISK2=/dev/disk/by-id/nvme-Sabrent_288E0799135300048057
+
 if [ -z "${SWAPSIZE}" ] ; then
   getSwap
 fi
@@ -472,7 +484,8 @@ SERVICES_ENABLED="dbus sshd dhcpcd cupsd wpa_supplicant bluetoothd"
 # ==============================
 #  Generate Internal Variables from settings
 # ==============================
-BOOTDEVICE="${DISK}"
+BOOTDEVICE1="${DISK1}"
+BOOTDEVICE2="${DISK2}"
 MNT="/run/ovlwork/mnt"
 CHROOT="chroot ${MNT}"
 
